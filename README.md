@@ -155,7 +155,7 @@ contract once the application scaffold and Docker configuration are present.
 
 ### Prerequisites
 
-- Node.js
+- Node.js 22 LTS (recommended; see `.nvmrc`)
 - Docker and Docker Compose
 - PostgreSQL
 - Redis
@@ -165,6 +165,7 @@ contract once the application scaffold and Docker configuration are present.
 ```bash
 git clone <repo-url>
 cd distributed-workflow-engine
+nvm use
 npm install
 ```
 
