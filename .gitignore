@@ -17,4 +17,5 @@ npm-debug.log*
 .DS_Store
 .idea/
 .vscode/
+.jetro/
 

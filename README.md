@@ -180,11 +180,29 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 ```
 
+Environment variables are loaded centrally through Nest's `ConfigModule`.
+Runtime modules consume typed application and Redis settings from the
+configuration service rather than reading environment variables directly.
+
 ### Run Infrastructure and Backend
 
 ```bash
 docker-compose up --build
 npm run start:dev
+```
+
+### API Documentation
+
+When the backend is running, interactive Swagger documentation is available at:
+
+```text
+http://localhost:3000/docs
+```
+
+The generated OpenAPI JSON document is available at:
+
+```text
+http://localhost:3000/docs-json
 ```
 
 ## Planned Persistence Model
