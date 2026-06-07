@@ -18,9 +18,9 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "redis:start": "docker run -d --rm --name jobprocessor-redis -p 6379:6379 redis:7-alpine",
-    "redis:stop": "docker stop jobprocessor-redis",
-    "redis:logs": "docker logs -f jobprocessor-redis"
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "infra:logs": "docker compose logs -f"
   },
   "dependencies": {
     "@nestjs/bullmq": "^11.0.4",
