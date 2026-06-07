@@ -1,10 +1,15 @@
+import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { VALIDATION_PIPE_OPTIONS } from './common/validation';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  // Validate every request body at the boundary: strip/reject unknown fields
+  // and transform JSON into validated DTO instances. See VALIDATION_PIPE_OPTIONS.
+  app.useGlobalPipes(new ValidationPipe(VALIDATION_PIPE_OPTIONS));
   const configService = app.get(ConfigService);
   const port = configService.getOrThrow<number>('app.port');
   const swaggerConfig = new DocumentBuilder()
