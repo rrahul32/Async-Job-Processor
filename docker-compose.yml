@@ -1,0 +1,145 @@
+# Local development infrastructure for the Distributed Workflow Orchestration
+# Platform. Brings up the Redis (BullMQ) and PostgreSQL services every
+# contributor shares, plus optional inspection UIs behind the `tools` profile.
+#
+#   docker compose up -d                 # redis + postgres
+#   docker compose --profile tools up -d # also redis-commander + pgadmin
+#
+# Hardened toward a production-grade bar (see tasks/README.md "Engineering
+# Standards"): images are digest-pinned for byte-identical environments, every
+# service has bounded memory/CPU + rotated logs + a graceful stop period, Redis
+# requires auth and never evicts queued jobs, and Postgres runs with data
+# checksums. A fixed project name keeps container/volume names stable.
+name: jobprocessor
+
+# Rotated JSON logs so container logs can never grow unbounded on disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+services:
+  redis:
+    # Digest-pinned redis 7.4.9-alpine (multi-arch manifest) for reproducibility.
+    image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    container_name: jobprocessor-redis
+    # - appendonly yes         : AOF durability (<=1s loss) — queued jobs survive a crash.
+    # - requirepass            : Redis is never open, even locally (mirrors prod).
+    # - maxmemory + noeviction : bounded memory; NEVER silently evict queued jobs —
+    #                            reject writes (backpressure) instead of losing work.
+    command:
+      - 'redis-server'
+      - '--appendonly'
+      - 'yes'
+      - '--requirepass'
+      - '${REDIS_PASSWORD:-localdev_redis_pw}'
+      - '--maxmemory'
+      - '${REDIS_MAXMEMORY:-256mb}'
+      - '--maxmemory-policy'
+      - 'noeviction'
+    environment:
+      # Lets the healthcheck's redis-cli authenticate without putting the
+      # password on the command line (no leak to the process list / no warning).
+      REDISCLI_AUTH: '${REDIS_PASSWORD:-localdev_redis_pw}'
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  postgres:
+    # Digest-pinned postgres 16.14-alpine (multi-arch manifest) for reproducibility.
+    image: postgres@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
+    container_name: jobprocessor-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-workflows}
+      # Data checksums detect silent on-disk corruption (set once, at initdb).
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready reports ready only once Postgres accepts connections, so
+      # dependents waiting on `service_healthy` don't start too early.
+      test:
+        ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-workflows}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1024M
+        reservations:
+          memory: 256M
+
+  # ---- Optional inspection UIs (off by default) -------------------------------
+  # Start with: docker compose --profile tools up -d
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: jobprocessor-redis-commander
+    profiles: ['tools']
+    environment:
+      # label:host:port:db:password — authenticates against the secured Redis.
+      REDIS_HOSTS: 'local:redis:6379:0:${REDIS_PASSWORD:-localdev_redis_pw}'
+    ports:
+      - '${REDIS_COMMANDER_PORT:-8081}:8081'
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: jobprocessor-pgadmin
+    profiles: ['tools']
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@local.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      # Single-user desktop mode: skip the login screen for local dev.
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    ports:
+      - '${PGADMIN_PORT:-8082}:80'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  redis-data:
+  postgres-data:

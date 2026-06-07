@@ -5,6 +5,7 @@ export interface ApplicationConfiguration {
   redis: {
     host: string;
     port: number;
+    password: string;
   };
 }
 
@@ -31,5 +32,11 @@ export default (): ApplicationConfiguration => ({
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: getPort('REDIS_PORT', 6379),
+    // Redis auth. Unset → the Compose stack's local-dev password (zero-config
+    // boot); set REDIS_PASSWORD for your own Redis; set it empty (REDIS_PASSWORD=)
+    // to disable auth for a bring-your-own Redis that requires none — ioredis
+    // sends no AUTH for an empty password. `??` (not `||`) keeps the explicit
+    // empty string instead of falling back to the default.
+    password: process.env.REDIS_PASSWORD ?? 'localdev_redis_pw',
   },
 });
