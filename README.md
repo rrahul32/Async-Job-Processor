@@ -1,20 +1,27 @@
 # Distributed Workflow Orchestration Platform
 
 A production-oriented workflow orchestration platform for e-commerce backends,
-designed around Node.js, NestJS, Redis, BullMQ, PostgreSQL, and Prisma.
+designed around Node.js, NestJS, Redis, BullMQ, RabbitMQ, PostgreSQL, and
+Prisma.
 
 The project explores the mechanics behind durable, asynchronous execution:
-distributed workers, retries, state persistence, fault recovery,
-observability, and compensation workflows. It is inspired by orchestration
-engines such as [Temporal](https://temporal.io/),
+distributed workers, retries, state persistence, fault recovery, read caching,
+reliable event publishing, observability, and compensation workflows. It is
+inspired by orchestration engines such as [Temporal](https://temporal.io/),
 [Cadence](https://cadenceworkflow.io/), and
 [AWS Step Functions](https://aws.amazon.com/step-functions/).
 
+Every notable failure found while building and load-testing the platform —
+induced or genuine — is recorded in [`INCIDENTS.md`](INCIDENTS.md) as
+*symptom → diagnosis → fix → lesson*, because operating a system teaches more
+than building it.
+
 ## Status
 
-This project is in active development. The current target is Phase 1:
-establish queue infrastructure, worker execution, retries, asynchronous
-processing, and PostgreSQL-backed workflow state.
+This project is in active development. Tasks 01–03 are done (hardened local
+infrastructure, validated order intake, Postgres/Prisma persistence). The
+current target is completing Phase 1: workflow state persistence and real step
+execution. See the full backlog in [`tasks/README.md`](tasks/README.md).
 
 ## Goals
 
@@ -22,34 +29,42 @@ The platform is intended to support e-commerce workflow scenarios including:
 
 - Order processing
 - Inventory reservation
-- Payment processing
+- Payment processing (rate-limited, circuit-broken external calls)
 - Invoice generation
 - Shipping orchestration
-- Retry recovery
+- Retry recovery and dead-lettering
 - Saga-based compensation handling
+- Lifecycle event publishing for external consumers
 
 ## Target Architecture
 
 ```text
-Client/API Request
-        |
-        v
-API Gateway
-        |
-        v
-Workflow Engine
-        |
-        v
-BullMQ Queue <--> Redis
-        |
-        v
-Distributed Workers
-        |
-        v
-PostgreSQL Persistence
-        |
-        v
-Observability Stack
+Client
+  |
+  v
+NestJS API  --(cache-aside reads)-->  Redis (cache: LRU, TTL+jitter,
+  |   |                                      single-flight rebuild)
+  |   '--(state + outbox event,
+  |        one Postgres transaction)
+  v
+BullMQ Queue  <-->  Redis (queue: AOF, auth, noeviction)
+  |
+  v
+Distributed Workers (xN)
+  [steps - retries/backoff - idempotency - saga compensation]
+  |                  |
+  |                  '--> external providers (token-bucket rate limit,
+  |                       circuit breaker, timeouts)
+  v
+PostgreSQL (workflow state, retry history, DLQ records, outbox)
+  |
+  v
+Outbox Relay --> RabbitMQ (topic exchange) --> consumers (audit log, ...)
+                     |
+                     '--> Kafka topic (stretch) --> analytics / replay
+
+Observability across all of it: pino JSON logs with correlation IDs,
+Prometheus metrics + Grafana, OpenTelemetry traces.
 ```
 
 An example order workflow:
@@ -73,13 +88,16 @@ Send Confirmation Email
 Mark Workflow Complete
 ```
 
-The initial processing flow is planned as:
+The core processing flow:
 
 ```text
 POST /orders
       |
       v
-Save Order
+Validate + idempotency key
+      |
+      v
+Save Order + Workflow State (+ outbox event, same transaction)
       |
       v
 Push Job To Queue
@@ -88,13 +106,13 @@ Push Job To Queue
 Worker Picks Job
       |
       v
-Execute Workflow Steps
+Execute Workflow Steps (resume from last completed on crash)
       |
       v
-Persist State
+Persist State / Publish Lifecycle Events
       |
       v
-Retry On Failure
+Retry On Failure -> DLQ on exhaustion / Saga compensation on partial failure
       |
       v
 Complete Workflow
@@ -105,21 +123,30 @@ Complete Workflow
 | Area | Technology |
 | --- | --- |
 | Backend | Node.js, TypeScript, NestJS |
-| Queues | Redis, BullMQ |
+| Job queue | Redis, BullMQ |
+| Event bus | RabbitMQ (transactional outbox); Kafka (stretch: streaming + replay) |
+| Caching | Redis (cache-aside, stampede protection) |
 | Database | PostgreSQL, Prisma ORM |
 | Infrastructure | Docker, Docker Compose |
-| Observability | OpenTelemetry, Prometheus, Grafana |
+| Observability | pino structured logging, OpenTelemetry, Prometheus, Grafana |
+| Quality | Jest, k6 load testing, fault injection, GitHub Actions CI |
 
 ## Planned Features
 
 - Durable workflow execution and recovery after crashes
 - Configurable retries, delayed jobs, and dead-letter queues
+- Idempotent intake and step execution
 - Saga compensation support
-- Dynamic DAG workflows
+- Read caching with deliberate invalidation and stampede protection
+- Reliable lifecycle event publishing (transactional outbox → RabbitMQ;
+  Kafka streaming + replay as a stretch goal)
+- Distributed rate limiting and circuit breakers for external calls
 - Distributed worker heartbeats and horizontal scaling
+- Structured JSON logs with correlation IDs propagated through the queue
 - OpenTelemetry traces, Prometheus metrics, and Grafana dashboards
-- Workflow visualization
-- Fault injection and load testing
+- Dynamic DAG workflows
+- Fault injection and load testing, with findings logged in
+  [`INCIDENTS.md`](INCIDENTS.md)
 
 ## Proposed Project Structure
 
@@ -131,6 +158,8 @@ src/
 |-- queue/
 |-- workers/
 |-- workflows/
+|-- cache/
+|-- events/        # outbox relay + consumers
 |-- common/
 `-- main.ts
 ```
@@ -142,6 +171,7 @@ apps/
   api-gateway/
   workflow-engine/
   worker-service/
+  event-consumers/
 
 packages/
   shared/
@@ -226,7 +256,8 @@ The stack is hardened toward a production-grade bar: images are **digest-pinned*
 (byte-identical across machines), **Redis requires auth** and never evicts queued
 jobs (`maxmemory` + `noeviction`), and every service has **bounded memory/CPU**,
 **rotated logs**, and a **graceful stop period**. Postgres runs with
-`--data-checksums` to catch silent corruption.
+`--data-checksums` to catch silent corruption. Later tasks add RabbitMQ, a cache
+Redis, and the observability stack to the same Compose file at the same bar.
 
 #### Optional inspection UIs
 
@@ -255,9 +286,9 @@ The generated OpenAPI JSON document is available at:
 http://localhost:3000/docs-json
 ```
 
-## Planned Persistence Model
+## Persistence Model
 
-The workflow engine is expected to persist operational state in tables such as:
+The workflow engine persists operational state in tables such as:
 
 - `workflows`
 - `workflow_runs`
@@ -265,16 +296,21 @@ The workflow engine is expected to persist operational state in tables such as:
 - `step_executions`
 - `retry_history`
 - `dead_letter_queue`
+- `outbox_events`
 
 ## Roadmap
 
 | Phase | Focus |
 | --- | --- |
-| 1 | Redis queues, workers, retries, and PostgreSQL persistence |
-| 2 | Durable execution, recovery, and distributed workers |
-| 3 | Tracing, metrics, monitoring, and dashboards |
-| 4 | Horizontal scaling, fault injection, CI/CD, and load testing |
-| 5 | DAG workflows, compensation engine, Kafka support, and benchmarking |
+| 1 | Foundations — infra, validation, persistence, workflow state & step execution |
+| 2 | Resilience — structured logging/correlation IDs, retries, DLQ, idempotency |
+| 3 | Caching & eventing — read cache with stampede protection; transactional outbox + RabbitMQ |
+| 4 | Distributed execution — saga compensation, durable recovery, scaling, health |
+| 5 | Production operations — rate limiting & breakers, metrics, tracing, CI/CD + load & fault testing |
+| 6 | Advanced — dynamic DAG engine; Kafka streaming & replay (stretch) |
+
+The dependency-ordered backlog with per-task scope and acceptance criteria lives
+in [`tasks/README.md`](tasks/README.md).
 
 ## Learning Objectives
 
@@ -282,7 +318,12 @@ This project is a practical deep dive into:
 
 - Distributed systems and backend scalability
 - Asynchronous processing and worker coordination
-- Idempotency, retries, backoff, and failure recovery
+- Queueing vs brokering vs streaming — BullMQ, RabbitMQ, and Kafka, each used
+  where it fits, with the trade-offs felt rather than recited
+- Production caching: cache-aside, invalidation, TTL jitter, stampede defense
+- Reliable event publishing: the dual-write problem and the transactional outbox
+- Idempotency, retries, backoff, rate limiting, circuit breaking, and failure
+  recovery
 - Durable state management and compensation workflows
 - Tracing, structured logging, metrics, and production debugging
 
@@ -298,4 +339,6 @@ Rahul Reghu
 - [Temporal Documentation](https://docs.temporal.io/)
 - [BullMQ Documentation](https://docs.bullmq.io/)
 - [NestJS Documentation](https://docs.nestjs.com/)
+- [Transactional Outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html)
+- [RabbitMQ Documentation](https://www.rabbitmq.com/docs)
 - [OpenTelemetry Documentation](https://opentelemetry.io/docs/)

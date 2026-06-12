@@ -1,0 +1,195 @@
+// Prisma schema for the Distributed Workflow Orchestration Platform.
+//
+// Phase-1 persistence foundation (task 03). The model is split into
+// *definitions* (Workflow, WorkflowStep — seeded, few rows) and *instances*
+// (WorkflowRun, StepExecution — one set per order, high cardinality). Later
+// tasks extend this: 04 writes runs/executions, 06 writes RetryHistory, 07
+// writes DeadLetterQueue, 09 adds compensation, 10 drives crash recovery off
+// the `status` indexes.
+//
+// Prisma 7 notes:
+// - `prisma-client` generator (Rust-free client engine), emitted as CommonJS
+//   into `src/` so Nest compiles it. The folder is gitignored and regenerated
+//   on `postinstall`.
+// - The runtime connection is supplied by a `pg` driver adapter in
+//   PrismaService; the datasource block only declares the provider. The CLI
+//   reads `DATABASE_URL` via `prisma.config.ts`.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/prisma/generated"
+  runtime      = "nodejs"
+  moduleFormat = "cjs"
+  engineType   = "client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums — lifecycle state machines. Free-text status would allow invalid
+// transitions; an enum constrains the domain at the database level.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of one workflow run (instance). Written by tasks 04/07/10.
+/// Ordering reflects the happy path: PENDING (row created) → QUEUED (job
+/// enqueued) → RUNNING (worker picked it up) → COMPLETED | FAILED. Task 09
+/// will extend this with COMPENSATED.
+enum WorkflowRunStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// Lifecycle of one step execution within a run. Written by task 05.
+/// Task 09 will extend this with COMPENSATED.
+enum StepExecutionStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// State of a dead-lettered job (task 07). Durable record in Postgres; the
+/// Redis copy is trimmed so the DLQ can't grow unbounded under noeviction.
+enum DeadLetterStatus {
+  PENDING
+  REPLAYED
+}
+
+// ---------------------------------------------------------------------------
+// Definitions (seeded) — a workflow template and its ordered steps.
+// ---------------------------------------------------------------------------
+
+/// A workflow *definition* (template), e.g. "order-processing". Seeded; one row
+/// per workflow type. Task 15 turns this into a dynamic DAG.
+model Workflow {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  name        String   @unique
+  version     Int      @default(1)
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  steps WorkflowStep[]
+  runs  WorkflowRun[]
+
+  @@map("workflows")
+}
+
+/// A step *definition* within a workflow, ordered by `position`. Seeded (the
+/// five order steps arrive in task 05).
+model WorkflowStep {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  workflowId String   @db.Uuid
+  name       String
+  position   Int
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Deleting a definition removes its step definitions; in practice
+  // definitions are never deleted (they have runs that Restrict it).
+  workflow       Workflow        @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  stepExecutions StepExecution[]
+
+  @@unique([workflowId, position])
+  @@unique([workflowId, name])
+  @@map("workflow_steps")
+}
+
+// ---------------------------------------------------------------------------
+// Instances (per order) — runs, step executions, retries, dead letters.
+// ---------------------------------------------------------------------------
+
+/// One *execution instance* of a workflow — created per order (task 04).
+model WorkflowRun {
+  id         String            @id @default(uuid(7)) @db.Uuid
+  workflowId String            @db.Uuid
+  /// Business order id (server-owned, generated in OrdersService). Unique so a
+  /// run is addressable by order for `GET /orders/:id` (task 04).
+  orderId    String            @unique
+  status     WorkflowRunStatus @default(PENDING)
+  /// The validated order payload, retained for inspection/replay.
+  input      Json?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  // Restrict: a definition with runs cannot be deleted — protects audit history.
+  workflow       Workflow          @relation(fields: [workflowId], references: [id], onDelete: Restrict)
+  stepExecutions StepExecution[]
+  deadLetters    DeadLetterQueue[]
+
+  // Recovery sweep (task 10) scans for non-terminal runs; index `status`.
+  @@index([status])
+  @@index([workflowId])
+  @@map("workflow_runs")
+}
+
+/// One execution of one step within a run (task 05 writes these). Append-only
+/// audit record of what the worker did.
+model StepExecution {
+  id             String              @id @default(uuid(7)) @db.Uuid
+  workflowRunId  String              @db.Uuid
+  /// Nullable so ad-hoc/compensation steps (task 09) without a seeded
+  /// definition can still be recorded.
+  workflowStepId String?             @db.Uuid
+  status         StepExecutionStatus @default(PENDING)
+  attempts       Int                 @default(0)
+  output         Json?
+  error          String?
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  workflowRun  WorkflowRun    @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  // SetNull: keep the execution audit even if a step definition is removed.
+  workflowStep WorkflowStep?  @relation(fields: [workflowStepId], references: [id], onDelete: SetNull)
+  retries      RetryHistory[]
+
+  @@index([workflowRunId])
+  @@index([status])
+  @@map("step_executions")
+}
+
+/// One recorded retry attempt of a step (task 06 writes these). Append-only.
+model RetryHistory {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  stepExecutionId String   @db.Uuid
+  attempt         Int
+  error           String?
+  createdAt       DateTime @default(now())
+
+  stepExecution StepExecution @relation(fields: [stepExecutionId], references: [id], onDelete: Cascade)
+
+  @@index([stepExecutionId])
+  @@map("retry_history")
+}
+
+/// A job that exhausted its retries (task 07). The durable record lives here in
+/// Postgres; the Redis footprint is trimmed so the DLQ stays bounded.
+model DeadLetterQueue {
+  id            String           @id @default(uuid(7)) @db.Uuid
+  /// Nullable + SetNull: the DLQ record must outlive run cleanup and is never
+  /// lost just because a run row is gone.
+  workflowRunId String?          @db.Uuid
+  /// Originating BullMQ job id and queue, for traceability and replay.
+  jobId         String
+  queueName     String
+  payload       Json
+  failureReason String?
+  status        DeadLetterStatus @default(PENDING)
+  createdAt     DateTime         @default(now())
+  replayedAt    DateTime?
+
+  workflowRun WorkflowRun? @relation(fields: [workflowRunId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([workflowRunId])
+  @@map("dead_letter_queue")
+}

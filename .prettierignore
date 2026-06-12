@@ -1,0 +1,4 @@
+# Machine-written code — formatting it would diverge from the next
+# `prisma generate`. The CLI chains to .gitignore, but editor integrations
+# (VS Code Prettier, format-on-save) read only this file, so it must exist.
+src/prisma/generated/

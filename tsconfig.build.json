@@ -1,5 +1,8 @@
 {
+  // Compile ONLY src/ — stated positively so no future root-level *.ts file
+  // (prisma.config.ts today, a vitest.config.ts tomorrow) can shift tsc's
+  // inferred rootDir and move the entrypoint from dist/main.js to dist/src/main.js.
   "extends": "./tsconfig.json",
-  "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
+  "include": ["src/**/*"],
+  "exclude": ["**/*spec.ts"]
 }
-

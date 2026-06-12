@@ -10,6 +10,10 @@ async function bootstrap() {
   // Validate every request body at the boundary: strip/reject unknown fields
   // and transform JSON into validated DTO instances. See VALIDATION_PIPE_OPTIONS.
   app.useGlobalPipes(new ValidationPipe(VALIDATION_PIPE_OPTIONS));
+  // Listen for SIGINT/SIGTERM so providers' onModuleDestroy hooks run on
+  // shutdown — e.g. PrismaService.$disconnect() releases DB connections
+  // cleanly instead of leaking them. Foundation for graceful shutdown (task 12).
+  app.enableShutdownHooks();
   const configService = app.get(ConfigService);
   const port = configService.getOrThrow<number>('app.port');
   const swaggerConfig = new DocumentBuilder()
